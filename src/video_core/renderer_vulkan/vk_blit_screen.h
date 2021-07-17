@@ -70,10 +70,12 @@ private:
     void CreateDescriptorSets();
     void CreatePipelineLayout();
     void CreateGraphicsPipeline();
+    void CreateFSRPipeline();
     void CreateSampler();
 
     void CreateDynamicResources();
     void CreateFramebuffers();
+    void CreateFSRImages();
 
     void RefreshResources(const Tegra::FramebufferConfig& framebuffer);
     void ReleaseRawImages();
@@ -87,6 +89,8 @@ private:
     u64 CalculateBufferSize(const Tegra::FramebufferConfig& framebuffer) const;
     u64 GetRawImageOffset(const Tegra::FramebufferConfig& framebuffer,
                           std::size_t image_index) const;
+
+    bool fsr = true;
 
     Core::Memory::Memory& cpu_memory;
     Core::Frontend::EmuWindow& render_window;
@@ -107,6 +111,14 @@ private:
     std::vector<vk::Framebuffer> framebuffers;
     vk::DescriptorSets descriptor_sets;
     vk::Sampler sampler;
+
+    vk::ShaderModule easu_shader;
+    vk::ShaderModule rcas_shader;
+    vk::Pipeline easu_pipeline;
+    vk::Pipeline rcas_pipeline;
+    std::vector<vk::Image> fsr_images;
+    std::vector<vk::ImageView> fsr_image_views;
+    std::vector<MemoryCommit> fsr_buffer_commits;
 
     vk::Buffer buffer;
     MemoryCommit buffer_commit;

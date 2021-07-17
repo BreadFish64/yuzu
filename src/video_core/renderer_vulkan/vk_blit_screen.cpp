@@ -11,11 +11,14 @@
 
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/div_ceil.h"
 #include "common/math_util.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/host_shaders/vulkan_fidelityfx_fsr_easu_comp_spv.h"
+#include "video_core/host_shaders/vulkan_fidelityfx_fsr_rcas_comp_spv.h"
 #include "video_core/host_shaders/vulkan_present_frag_spv.h"
 #include "video_core/host_shaders/vulkan_present_vert_spv.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -221,51 +224,145 @@ VkSemaphore VKBlitScreen::Draw(const Tegra::FramebufferConfig& framebuffer, bool
                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, write_barrier);
             });
     }
-    scheduler.Record([renderpass = *renderpass, framebuffer = *framebuffers[image_index],
-                      descriptor_set = descriptor_sets[image_index], buffer = *buffer,
-                      size = swapchain.GetSize(), pipeline = *pipeline,
-                      layout = *pipeline_layout](vk::CommandBuffer cmdbuf) {
-        const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
-        const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
-        const f32 bg_blue = Settings::values.bg_blue.GetValue() / 255.0f;
-        const VkClearValue clear_color{
-            .color = {.float32 = {bg_red, bg_green, bg_blue, 1.0f}},
-        };
-        const VkRenderPassBeginInfo renderpass_bi{
-            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-            .pNext = nullptr,
-            .renderPass = renderpass,
-            .framebuffer = framebuffer,
-            .renderArea =
-                {
-                    .offset = {0, 0},
-                    .extent = size,
-                },
-            .clearValueCount = 1,
-            .pClearValues = &clear_color,
-        };
-        const VkViewport viewport{
-            .x = 0.0f,
-            .y = 0.0f,
-            .width = static_cast<float>(size.width),
-            .height = static_cast<float>(size.height),
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
-        const VkRect2D scissor{
-            .offset = {0, 0},
-            .extent = size,
-        };
-        cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        cmdbuf.SetViewport(0, viewport);
-        cmdbuf.SetScissor(0, scissor);
+    if (!fsr) {
+        scheduler.Record([renderpass = *renderpass, framebuffer = *framebuffers[image_index],
+                          descriptor_set = descriptor_sets[image_index], buffer = *buffer,
+                          size = swapchain.GetSize(), pipeline = *pipeline,
+                          layout = *pipeline_layout](vk::CommandBuffer cmdbuf) {
+            const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
+            const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
+            const f32 bg_blue = Settings::values.bg_blue.GetValue() / 255.0f;
+            const VkClearValue clear_color{
+                .color = {.float32 = {bg_red, bg_green, bg_blue, 1.0f}},
+            };
+            const VkRenderPassBeginInfo renderpass_bi{
+                .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                .pNext = nullptr,
+                .renderPass = renderpass,
+                .framebuffer = framebuffer,
+                .renderArea =
+                    {
+                        .offset = {0, 0},
+                        .extent = size,
+                    },
+                .clearValueCount = 1,
+                .pClearValues = &clear_color,
+            };
+            const VkViewport viewport{
+                .x = 0.0f,
+                .y = 0.0f,
+                .width = static_cast<float>(size.width),
+                .height = static_cast<float>(size.height),
+                .minDepth = 0.0f,
+                .maxDepth = 1.0f,
+            };
+            const VkRect2D scissor{
+                .offset = {0, 0},
+                .extent = size,
+            };
+            cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            cmdbuf.SetViewport(0, viewport);
+            cmdbuf.SetScissor(0, scissor);
 
-        cmdbuf.BindVertexBuffer(0, buffer, offsetof(BufferData, vertices));
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptor_set, {});
-        cmdbuf.Draw(4, 1, 0, 0);
-        cmdbuf.EndRenderPass();
-    });
+            cmdbuf.BindVertexBuffer(0, buffer, offsetof(BufferData, vertices));
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptor_set,
+                                      {});
+            cmdbuf.Draw(4, 1, 0, 0);
+            cmdbuf.EndRenderPass();
+        });
+    } else {
+        scheduler.Record([easu_descriptor_set = descriptor_sets[image_index * 2],
+                          rcas_descriptor_set = descriptor_sets[image_index * 2 + 1],
+                          fsr_image = *fsr_images[image_index],
+                          swapchain_image = swapchain.GetImageIndex(image_index),
+                          layout = render_window.GetFramebufferLayout(),
+                          easu_pipeline = *easu_pipeline, rcas_pipeline = *rcas_pipeline,
+                          pipeline_layout = *pipeline_layout](vk::CommandBuffer cmdbuf) {
+            const VkImageMemoryBarrier base_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = 0,
+                .dstAccessMask = 0,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = {},
+                .subresourceRange =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+            };
+
+            // TODO: Support clear color
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, easu_pipeline);
+            cmdbuf.PushConstants(
+                pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                std::array<u32, 4>{0, 0, layout.screen.GetWidth(), layout.screen.GetHeight()});
+
+            {
+                VkImageMemoryBarrier fsr_write_barrier = base_barrier;
+                fsr_write_barrier.image = fsr_image,
+                fsr_write_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                fsr_write_barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                fsr_write_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, fsr_write_barrier);
+            }
+
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0,
+                                      easu_descriptor_set, {});
+            cmdbuf.Dispatch(Common::DivCeil(layout.screen.GetWidth(), 8u),
+                            Common::DivCeil(layout.screen.GetHeight(), 8u), 1);
+
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, rcas_pipeline);
+            cmdbuf.PushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                 std::array<u32, 4>{layout.screen.left, layout.screen.top,
+                                                    layout.screen.GetWidth(),
+                                                    layout.screen.GetHeight()});
+
+            {
+                std::array<VkImageMemoryBarrier, 2> barriers;
+                auto& fsr_read_barrier = barriers[0];
+                auto& swapchain_write_barrier = barriers[1];
+
+                fsr_read_barrier = base_barrier;
+                fsr_read_barrier.image = fsr_image;
+                fsr_read_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                fsr_read_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+                swapchain_write_barrier = base_barrier;
+                swapchain_write_barrier.image = swapchain_image;
+                swapchain_write_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                swapchain_write_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barriers);
+            }
+
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0,
+                                      rcas_descriptor_set, {});
+            cmdbuf.Dispatch(Common::DivCeil(layout.screen.GetWidth(), 8u),
+                            Common::DivCeil(layout.screen.GetHeight(), 8u), 1);
+
+            {
+                VkImageMemoryBarrier swapchain_present_barrier = base_barrier;
+                swapchain_present_barrier.image = swapchain_image,
+                swapchain_present_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                swapchain_present_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                       swapchain_present_barrier);
+            }
+        });
+    }
     return *semaphores[image_index];
 }
 
@@ -280,9 +377,14 @@ void VKBlitScreen::CreateStaticResources() {
 }
 
 void VKBlitScreen::CreateDynamicResources() {
-    CreateRenderPass();
-    CreateFramebuffers();
-    CreateGraphicsPipeline();
+    if (!fsr) {
+        CreateRenderPass();
+        CreateFramebuffers();
+        CreateGraphicsPipeline();
+    } else {
+        CreateFSRPipeline();
+        CreateFSRImages();
+    }
 }
 
 void VKBlitScreen::RefreshResources(const Tegra::FramebufferConfig& framebuffer) {
@@ -300,6 +402,9 @@ void VKBlitScreen::RefreshResources(const Tegra::FramebufferConfig& framebuffer)
 void VKBlitScreen::CreateShaders() {
     vertex_shader = BuildShader(device, VULKAN_PRESENT_VERT_SPV);
     fragment_shader = BuildShader(device, VULKAN_PRESENT_FRAG_SPV);
+
+    easu_shader = BuildShader(device, VULKAN_FIDELITYFX_FSR_EASU_COMP_SPV);
+    rcas_shader = BuildShader(device, VULKAN_FIDELITYFX_FSR_EASU_COMP_SPV);
 }
 
 void VKBlitScreen::CreateSemaphores() {
@@ -309,26 +414,49 @@ void VKBlitScreen::CreateSemaphores() {
 }
 
 void VKBlitScreen::CreateDescriptorPool() {
-    const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
-        {
-            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = static_cast<u32>(image_count),
-        },
-        {
-            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = static_cast<u32>(image_count),
-        },
-    }};
+    if (!fsr) {
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {
+                .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = static_cast<u32>(image_count),
+            },
+            {
+                .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = static_cast<u32>(image_count),
+            },
+        }};
 
-    const VkDescriptorPoolCreateInfo ci{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = static_cast<u32>(image_count),
-        .poolSizeCount = static_cast<u32>(pool_sizes.size()),
-        .pPoolSizes = pool_sizes.data(),
-    };
-    descriptor_pool = device.GetLogical().CreateDescriptorPool(ci);
+        const VkDescriptorPoolCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = static_cast<u32>(image_count),
+            .poolSizeCount = static_cast<u32>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+        };
+        descriptor_pool = device.GetLogical().CreateDescriptorPool(ci);
+    } else {
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {
+                .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = static_cast<u32>(image_count * 2),
+            },
+            {
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .descriptorCount = static_cast<u32>(image_count * 2),
+            },
+        }};
+
+        const VkDescriptorPoolCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = static_cast<u32>(image_count * 2),
+            .poolSizeCount = static_cast<u32>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+        };
+        descriptor_pool = device.GetLogical().CreateDescriptorPool(ci);
+    }
 }
 
 void VKBlitScreen::CreateRenderPass() {
@@ -388,42 +516,72 @@ void VKBlitScreen::CreateRenderPass() {
 }
 
 void VKBlitScreen::CreateDescriptorSetLayout() {
-    const std::array<VkDescriptorSetLayoutBinding, 2> layout_bindings{{
-        {
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-            .pImmutableSamplers = nullptr,
-        },
-        {
-            .binding = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .pImmutableSamplers = nullptr,
-        },
-    }};
+    if (!fsr) {
+        const std::array<VkDescriptorSetLayoutBinding, 2> layout_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
 
-    const VkDescriptorSetLayoutCreateInfo ci{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .bindingCount = static_cast<u32>(layout_bindings.size()),
-        .pBindings = layout_bindings.data(),
-    };
+        const VkDescriptorSetLayoutCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<u32>(layout_bindings.size()),
+            .pBindings = layout_bindings.data(),
+        };
 
-    descriptor_set_layout = device.GetLogical().CreateDescriptorSetLayout(ci);
+        descriptor_set_layout = device.GetLogical().CreateDescriptorSetLayout(ci);
+    } else {
+        const std::array<VkDescriptorSetLayoutBinding, 2> layout_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
+
+        const VkDescriptorSetLayoutCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<u32>(layout_bindings.size()),
+            .pBindings = layout_bindings.data(),
+        };
+
+        descriptor_set_layout = device.GetLogical().CreateDescriptorSetLayout(ci);
+    }
 }
 
 void VKBlitScreen::CreateDescriptorSets() {
-    const std::vector layouts(image_count, *descriptor_set_layout);
+    const u32 sets = fsr ? image_count * 2 : image_count;
+    const std::vector layouts(sets, *descriptor_set_layout);
 
     const VkDescriptorSetAllocateInfo ai{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,
         .descriptorPool = *descriptor_pool,
-        .descriptorSetCount = static_cast<u32>(image_count),
+        .descriptorSetCount = sets,
         .pSetLayouts = layouts.data(),
     };
 
@@ -431,7 +589,7 @@ void VKBlitScreen::CreateDescriptorSets() {
 }
 
 void VKBlitScreen::CreatePipelineLayout() {
-    const VkPipelineLayoutCreateInfo ci{
+    VkPipelineLayoutCreateInfo ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -440,6 +598,15 @@ void VKBlitScreen::CreatePipelineLayout() {
         .pushConstantRangeCount = 0,
         .pPushConstantRanges = nullptr,
     };
+    VkPushConstantRange push_const{
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = sizeof(u32[2]),
+    };
+    if (fsr) {
+        ci.pushConstantRangeCount = 1;
+        ci.pPushConstantRanges = &push_const;
+    }
     pipeline_layout = device.GetLogical().CreatePipelineLayout(ci);
 }
 
@@ -584,6 +751,34 @@ void VKBlitScreen::CreateGraphicsPipeline() {
     pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci);
 }
 
+void VKBlitScreen::CreateFSRPipeline() {
+    VkPipelineShaderStageCreateInfo shader_stage{
+
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pName = "main",
+        .pSpecializationInfo = nullptr,
+    };
+
+    VkComputePipelineCreateInfo pipeline_ci{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .layout = *pipeline_layout,
+        .basePipelineIndex = 0,
+    };
+
+    shader_stage.module = *easu_shader;
+    pipeline_ci.stage = shader_stage;
+    easu_pipeline = device.GetLogical().CreateComputePipeline(pipeline_ci);
+
+    shader_stage.module = *rcas_shader;
+    pipeline_ci.stage = shader_stage;
+    rcas_pipeline = device.GetLogical().CreateComputePipeline(pipeline_ci);
+}
+
 void VKBlitScreen::CreateSampler() {
     const VkSamplerCreateInfo ci{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
@@ -629,6 +824,62 @@ void VKBlitScreen::CreateFramebuffers() {
         const VkImageView image_view{swapchain.GetImageViewIndex(i)};
         ci.pAttachments = &image_view;
         framebuffers[i] = device.GetLogical().CreateFramebuffer(ci);
+    }
+}
+
+void VKBlitScreen::CreateFSRImages() {
+    const auto& rect = render_window.GetFramebufferLayout().screen;
+    fsr_images.resize(image_count);
+    fsr_image_views.resize(image_count);
+    fsr_buffer_commits.resize(image_count);
+
+    for (size_t i = 0; i < image_count; ++i) {
+        fsr_images[i] = device.GetLogical().CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .extent =
+                {
+                    .width = rect.GetWidth(),
+                    .height = rect.GetHeight(),
+                    .depth = 1,
+                },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        fsr_buffer_commits[i] = memory_allocator.Commit(fsr_images[i], MemoryUsage::DeviceLocal);
+        fsr_image_views[i] = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *fsr_images[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .components =
+                {
+                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+                },
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        });
     }
 }
 
@@ -715,45 +966,101 @@ void VKBlitScreen::CreateRawImages(const Tegra::FramebufferConfig& framebuffer) 
 }
 
 void VKBlitScreen::UpdateDescriptorSet(std::size_t image_index, VkImageView image_view) const {
-    const VkDescriptorBufferInfo buffer_info{
-        .buffer = *buffer,
-        .offset = offsetof(BufferData, uniform),
-        .range = sizeof(BufferData::uniform),
-    };
+    if (!fsr) {
+        const VkDescriptorBufferInfo buffer_info{
+            .buffer = *buffer,
+            .offset = offsetof(BufferData, uniform),
+            .range = sizeof(BufferData::uniform),
+        };
 
-    const VkWriteDescriptorSet ubo_write{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = descriptor_sets[image_index],
-        .dstBinding = 0,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pImageInfo = nullptr,
-        .pBufferInfo = &buffer_info,
-        .pTexelBufferView = nullptr,
-    };
+        const VkWriteDescriptorSet ubo_write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = descriptor_sets[image_index],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &buffer_info,
+            .pTexelBufferView = nullptr,
+        };
 
-    const VkDescriptorImageInfo image_info{
-        .sampler = *sampler,
-        .imageView = image_view,
-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-    };
+        const VkDescriptorImageInfo image_info{
+            .sampler = *sampler,
+            .imageView = image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
 
-    const VkWriteDescriptorSet sampler_write{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = descriptor_sets[image_index],
-        .dstBinding = 1,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &image_info,
-        .pBufferInfo = nullptr,
-        .pTexelBufferView = nullptr,
-    };
+        const VkWriteDescriptorSet sampler_write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = descriptor_sets[image_index],
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
 
-    device.GetLogical().UpdateDescriptorSets(std::array{ubo_write, sampler_write}, {});
+        device.GetLogical().UpdateDescriptorSets(std::array{ubo_write, sampler_write}, {});
+    } else {
+        const auto fsr_image_view = *fsr_image_views[image_index];
+        const auto swapchain_image_view = swapchain.GetImageViewIndex(image_index);
+
+        const VkDescriptorImageInfo image_info{
+            .sampler = *sampler,
+            .imageView = image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        const VkDescriptorImageInfo fsr_image_info{
+            .sampler = *sampler,
+            .imageView = fsr_image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        const VkDescriptorImageInfo swapchain_image_info{
+            .sampler = *sampler,
+            .imageView = swapchain_image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+
+        VkWriteDescriptorSet sampler_write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = descriptor_sets[image_index * 2],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+
+        VkWriteDescriptorSet output_write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = descriptor_sets[image_index * 2],
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &fsr_image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+
+        device.GetLogical().UpdateDescriptorSets(std::array{sampler_write, output_write}, {});
+
+        sampler_write.dstSet = descriptor_sets[image_index * 2 + 1];
+        sampler_write.pImageInfo = &fsr_image_info;
+        output_write.dstSet = descriptor_sets[image_index * 2 + 1];
+        output_write.pImageInfo = &swapchain_image_info;
+
+        device.GetLogical().UpdateDescriptorSets(std::array{sampler_write, output_write}, {});
+    }
 }
 
 void VKBlitScreen::SetUniformData(BufferData& data,

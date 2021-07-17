@@ -46,3 +46,6 @@
 [submodule "externals/cpp-httplib"]
 	path = externals/cpp-httplib
 	url = https://github.com/yhirose/cpp-httplib.git
+[submodule "externals/FidelityFX-FSR"]
+	path = externals/FidelityFX-FSR
+	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
